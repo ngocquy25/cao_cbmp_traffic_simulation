@@ -1,0 +1,10 @@
+﻿Scenario,Chỉ số,CBMP Fair Paper (mean ± std),CBMP Area (mean ± std),Cải thiện Area vs Fair Paper (%),p-value (Area vs Fair Paper),Ý nghĩa (p<0.05)
+Low (400 vph),Avg Queue (xe),48.50 ± 0.83,44.36 ± 0.53,8.6,1.52e-08,Có ✓
+Low (400 vph),Throughput (xe),7780.50 ± 135.68,7824.60 ± 44.07,0.6,0.2926,Không
+Low (400 vph),Avg Delay (s),20.25 ± 0.30,17.39 ± 0.45,14.1,1.64e-09,Có ✓
+Medium (900 vph),Avg Queue (xe),110.24 ± 1.58,101.39 ± 1.43,8.0,3.04e-07,Có ✓
+Medium (900 vph),Throughput (xe),17515.60 ± 138.23,17596.20 ± 115.82,0.5,0.1696,Không
+Medium (900 vph),Avg Delay (s),20.50 ± 0.39,17.75 ± 0.25,13.4,6.13e-08,Có ✓
+High (1400 vph),Avg Queue (xe),173.27 ± 1.51,161.31 ± 2.32,6.9,3.25e-07,Có ✓
+High (1400 vph),Throughput (xe),27441.70 ± 148.55,27489.70 ± 125.58,0.2,0.3564,Không
+High (1400 vph),Avg Delay (s),20.57 ± 0.32,18.28 ± 0.37,11.2,5.24e-08,Có ✓

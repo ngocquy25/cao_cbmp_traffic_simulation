@@ -1,0 +1,539 @@
+/**
+* Name: NewModel
+* Based on the internal empty template. 
+* Author: smth
+* Tags: 
+*/
+
+model Traffic
+import "Road.gaml"
+import "Intersection.gaml"
+import "Roi.gaml"
+import "Vehicles.gaml"
+
+
+/* Insert your model definition here */
+global {
+	image_file background_img <- image_file("../includes/2/bg1.png");
+	
+	file road_shp <- shape_file("../includes/2/road 4.shp");
+	file building_shp <- shape_file("../includes/2/building.shp");
+	// Dynamic shapefile assignment based on algorithm mode (from folder zone when use_cbmp is true)
+	file signal_shp <- use_cbmp ? shape_file("../includes/2/traffic_signals 8.shp") : shape_file("../includes/2/traffic_signals 6.shp");
+	file roi_lane_shp <- use_cbmp ? shape_file("../includes/2/ROI_zones 2.shp") : shape_file("../includes/2/ROI_zones 7.shp");
+	
+	geometry shape <- envelope(road_shp);
+	graph road_network;
+	float step <- 0.5 #s;
+	int target_motobike <- 1000;
+	int target_car <- 300;
+	int target_truck <- 50;
+	int target_ambulance <- 5;
+	float spawn_rate <- 1.0;
+	
+	// Traffic demand scenario from paper (3 kịch bản chuẩn: Thấp, Trung bình, Cao)
+	string traffic_demand <- "Medium (900 vph)" among: ["Low (400 vph)", "Medium (900 vph)", "High (1400 vph)"];
+	float spawn_timer <- 0.0;
+	
+	//obj for controller mode
+	// false/false = Fixed-time | true/false = CBMP v1 (phi) | false/true = CBMP v2 (Paper)
+	bool use_cbmp <- false;
+	bool use_paper_cbmp <- true;  // Paper-faithful: formula (10)(11)(16), vehicle count + c_{l,m}
+	string algorithm_mode <- "CBMP_Area" among: ["CBMP_Area", "CBMP_Paper_Fair"];
+	float paper_detection_radius <- 150.0;
+	float c_saturation_flow <- 1.5; // He so dong bao hoa c (giam xuong 1.5 mo ta xe qua nga tu cham)
+	float intersection_speed_limit <- 12.0 #km / #h; // Toc do toi da khi qua nga tu (giam toc de quan sat va tranh xung dot)
+	bool debug_mode <- false; // Enable verbose logging for verification (toggle in experiment)
+	
+	//obj for KPIs (Đo lường hiệu năng)
+	string csv_filename;
+	
+	// --- KPI SUMMARY VARIABLES (for area-based simulation summary) ---
+	float total_queue_sum <- 0.0;      
+	int total_throughput <- 0;         
+	float total_delay_sum <- 0.0;      
+	int total_samples <- 0;            
+	bool stop_simulation <- false;
+	float sim_end_time <- 7200.0;      // 1 hour in seconds
+	bool is_batch_mode <- false;       
+	string base_output_dir <- "../outputs/";
+	int replicate_id <- 0;
+	
+	list<intersection> spawn_nodes; // spawn points at the edge of the map
+	map<road, float> road_heat;  // smoothed heat value for road density
+	int heat_tick <- 0;          // step counter to update heatmap periodically
+
+	// update road_heat using ema for smooth color transitions
+	reflex update_road_counts when: !is_batch_mode {
+		heat_tick <- heat_tick + 1;
+		if (heat_tick mod 5 = 0) {
+			// instant vehicle count per road
+			map<road, int> cur <- map<road,int>([]);
+			loop v over: (motobike as list) + (car as list) + (truck as list)  {
+				if (v.current_road != nil) {
+					road rd <- road(v.current_road);
+					if (rd != nil) {
+						cur[rd] <- (cur contains_key rd) ? cur[rd] + 1 : 1;
+					}
+				}
+			}
+			// apply ema smoothing for heat values
+			loop r over: road {
+				float new_val <- (cur contains_key r) ? min(float(cur[r]) / 40.0, 1.0) : 0.0;
+				float old_val <- (road_heat contains_key r) ? road_heat[r] : 0.0;
+				road_heat[r] <- 0.7 * old_val + 0.3 * new_val;
+			}
+		}
+	}
+	// Write total summary row dynamically (Rewrite:true ensures the last line is always updated)
+	action write_summary {
+		if (total_samples > 0) {
+			float avg_queue <- total_queue_sum / total_samples;
+			float avg_delay <- (total_throughput > 0) ? total_delay_sum / total_throughput : 0.0;
+			string summary_line <- "TOTAL,0,0,"
+				+ string(avg_queue with_precision 2) + ","
+				+ string(total_throughput) + ","
+				+ string(avg_delay with_precision 2);
+			
+		}
+	}
+
+	// Simulation stop control check
+	reflex check_simulation_time when: time >= sim_end_time and !stop_simulation {
+		stop_simulation <- true;
+		write "Sim Time Stop: " + time;
+		do write_summary;
+		if (!is_batch_mode) { 
+			do pause; 
+		}else{
+			do die;
+		}
+	}
+
+	// ROI density sensor system (100% faithful to zone folder)
+	reflex roi_sensor_system when: use_cbmp {
+		ask roi_lane {
+			float accumulated_area <- 0.0;
+			list<vehicle> candidate_vehicles <- (motobike at_distance 25.0) + (car at_distance 25.0) + (truck at_distance 25.0);
+			
+			loop v over: candidate_vehicles {
+				point pos <- v.compute_position();
+				if (pos distance_to self.shape < 7.0) {
+					float my_area <- 1.5; 
+					if (species(v) = car) { my_area <- 7.5; }
+					else if (species(v) = truck) { my_area <- 18.0; }
+					accumulated_area <- accumulated_area + my_area;
+				}
+			}
+			
+			self.phi <- self.area_m2 > 0 ? accumulated_area / self.area_m2 : 0.0;
+			if (self.phi > 1.0) { self.phi <- 1.0; }
+		}
+	}
+	
+	// Network-wide pressure monitor (100% faithful to zone folder)
+	reflex global_network_monitor when: use_cbmp and !stop_simulation {
+		float r_left     <- 0.15; 
+		float r_straight <- 0.70;
+		float r_right    <- 0.15;
+
+		ask roi_lane {
+			self.phi_current <- self.phi;
+			self.w_max_pressure <- 0.0; 
+		}
+
+		ask roi_lane {
+			bool is_upstream <- (self.In_roi != nil and self.In_roi != "" and self.In_roi contains "_" and self.phase_id != nil and self.phase_id != "" and upper_case(self.phase_id) != "NONE");
+			
+			if (is_upstream) {
+				list<string> src_parts <- self.In_roi split_with "_"; 
+				
+				if (length(src_parts) >= 3) {
+					string current_junction <- src_parts[0]; 
+					string lane_index       <- src_parts[1]; 
+					string lane_axis        <- upper_case(src_parts[2]);
+					
+					string src_prefix <- lower_case(current_junction + "_" + lane_index);
+					float downstream_pressure_sum <- 0.0;
+					
+					list<roi_lane> downstream_links <- roi_lane where (
+						each.Out_roi != nil and each.Out_roi != "" and
+						lower_case(each.Out_roi) = src_prefix and
+						each.In_roi != nil and each.In_roi contains "_" and
+						length(each.In_roi split_with "_") >= 3
+					);
+					
+					loop link over: downstream_links {
+						string target_in_roi <- lower_case(link.In_roi);
+						
+						roi_lane dest <- first(roi_lane where (
+							each.In_roi != nil and 
+							lower_case(each.In_roi) = target_in_roi and
+							each.phase_id != nil and each.phase_id != "" and upper_case(each.phase_id) != "NONE"
+						));
+						
+						if (dest != nil) {
+							string dest_axis <- upper_case((link.In_roi split_with "_")[2]);
+							float weight <- r_straight; 
+							if (dest_axis = "LEFT") { weight <- r_left; }
+							else if (dest_axis = "RIGHT") { weight <- r_right; }
+							
+							downstream_pressure_sum <- downstream_pressure_sum + (weight * dest.phi_current);
+						}
+					}
+					
+					self.w_max_pressure <- max(0.0, self.phi_current - downstream_pressure_sum);
+				}
+			}
+		}
+
+
+	}
+	init {
+		if (algorithm_mode = "CBMP_Paper") {
+			use_paper_cbmp <- true;
+			use_cbmp <- false;
+			paper_detection_radius <- 150.0;
+		} else if(algorithm_mode = "CBMP_Paper_Fair"){
+			use_paper_cbmp <- true;
+			use_cbmp <- false;
+			paper_detection_radius <- 45.0;
+		}
+		else if (algorithm_mode = "CBMP_Area") {
+			use_paper_cbmp <- false;
+			use_cbmp <- true;
+		} else if (algorithm_mode = "FixedTime") {
+			use_paper_cbmp <- false;
+			use_cbmp <- false;
+		}
+		signal_shp <- shape_file("../includes/2/traffic_signals 8.shp");
+		roi_lane_shp <- shape_file("../includes/2/ROI_zones 2.shp");
+
+		
+		write "read data";
+		list<geometry> fixed_road <- clean_network(list<geometry>(road_shp.contents), 15.0, true, true);
+		create road from: road_shp with: [
+		    lanes :: int(read("lanes")), 
+		    width :: float(read("road_width")) 
+		];
+
+		create building from: building_shp;
+		
+		// Load roi_lane from shapefile 8 schema for all modes to align GIS structures
+		create roi_lane from: roi_lane_shp with: [
+			phase_id  :: read("phase_id"),
+			area_m2   :: float(read("area_m2")),
+			In_roi    :: read("In_roi"),
+			Out_roi   :: read("Out_roi")
+		];
+		
+		create friendly_roi_name_provider from: shape_file("../includes/2/ROI_zones 2.shp") with: [
+			In_roi :: read("In_roi")
+		];
+        
+		graph temp_graph <- as_edge_graph(road);
+		loop v over: temp_graph.vertices {
+			create intersection with: [shape::point(v)] {
+				is_traffic_signal <- false;
+			}
+		}
+		road_network <- as_driving_graph(road, intersection);
+		
+		// Initialize visual lights directly from signal_shp (Shapefile 8) for all modes
+		create traffic_light_visual from: signal_shp with: [
+			osm_id   :: string(read("osm_id")),
+			my_phase :: upper_case(string(read("sig_phase"))) 
+		];
+		
+		// Filter: only keep straight lights ending in _STRAIGHT
+		ask traffic_light_visual {
+			if (self.my_phase = nil or self.my_phase = "") {
+				do die;
+			} else {
+				string phase <- self.my_phase;
+				list<string> parts <- phase split_with "_";
+				if (!empty(parts) and upper_case(last(parts)) != "STRAIGHT") {
+					do die;
+				}
+			}
+		}
+		
+		// Associate lights with the closest intersection node
+		ask traffic_light_visual {
+			point my_loc <- self.location;
+			list<intersection> candidate_nodes <- intersection where (each distance_to my_loc <= 80.0);
+			if (!empty(candidate_nodes)) {
+				self.my_parent <- candidate_nodes closest_to my_loc;
+				self.my_parent.is_traffic_signal <- true;
+			}
+		}
+		
+		// Assign axis identifiers to support color changing in Paper and Fixed-time modes
+		ask traffic_light_visual {
+			string phase_upper <- upper_case(self.my_phase);
+			if (phase_upper contains "_NS" or phase_upper contains "_SN") {
+				self.axis <- "axis_1";
+			} else if (phase_upper contains "_EW" or phase_upper contains "_WE") {
+				self.axis <- "axis_2";
+			}
+		}
+
+		// identify spawn nodes based on graph degree
+		spawn_nodes <- intersection where (
+			!each.is_traffic_signal and
+			!empty(each.roads_out) and
+			(length(each.roads_out) + length(each.roads_in) <= 2)
+		);
+		// fallback if too few spawn nodes found
+		if (length(spawn_nodes) < 3) {
+			spawn_nodes <- intersection where (!each.is_traffic_signal and !empty(each.roads_out));
+		}
+		
+		int nb_moto <- 0;
+		int nb_car <- 0;
+		int nb_truck <- 0;
+		write "done";
+
+		// CSV filename reflects active algorithm mode and traffic demand
+		string demand_str <- "Custom";
+		if (traffic_demand = "Low (400 vph)") { demand_str <- "Low_400"; }
+		else if (traffic_demand = "Medium (900 vph)") { demand_str <- "Medium_900"; }
+		else if (traffic_demand = "High (1400 vph)") { demand_str <- "High_1400"; }
+		
+		string mode_str <-  (algorithm_mode = "CBMP_Paper_Fair") ? "CBMP_Paper_Fair" : (use_paper_cbmp ? "CBMP_Paper" : (use_cbmp ? "CBMP_Area" : "FixedTime"));
+		// ---  CHẠY KHI PARALLEL BỊ ĐỨNG  ---
+	 	//replicate_id <- int(self) mod 2 + 9;
+		
+		replicate_id <- int(self) mod 10 + 1; // <-- Dòng gốc 
+		string rep_str <- is_batch_mode ? "_rep" + replicate_id : "";
+		csv_filename <- mode_str + "_" + demand_str + rep_str + ".csv";
+		if (is_batch_mode) {
+			save "Intersection_Name,Cycle,Time_Seconds,Queue_Length,Throughput_per_Cycle,Average_Delay" to: base_output_dir + "KPI_Result_" + csv_filename format: "csv" rewrite: true;
+		}
+
+		
+		list<intersection> signal_nodes <- intersection where (each.is_traffic_signal);
+		loop while: not empty(signal_nodes){
+			intersection seed <- signal_nodes[0];
+			list<intersection> cluster <- signal_nodes where (each distance_to seed <= 50.0);
+			
+			create traffic_controller{
+				my_nodes <- cluster;
+				location <- cluster[0].location;
+				if (!use_cbmp) {
+					ask my_nodes {
+						do to_green;
+					}
+				}
+			}
+			signal_nodes <- signal_nodes - cluster;
+		}
+
+		// Assign phase IDs to ROI lanes based on their axis (100% faithful to zone folder)
+		if (true) {
+			ask intersection where (each.is_traffic_signal) {
+				intersection current_intersection <- self;
+				list<roi_lane> local_lanes <- roi_lane where (
+					each.In_roi != nil and each.In_roi != "" and each.In_roi contains "_" 
+					and (current_intersection.location distance_to each.location < 120.0)
+				);
+				self.my_lanes <- local_lanes;
+				
+				if (!empty(local_lanes)) {
+					string junction_name <- upper_case((local_lanes[0].In_roi split_with "_")[0]);
+					
+					string phase_ns  <- junction_name + "_NS"; 
+					string phase_ew  <- junction_name + "_EW"; 
+					
+					if !(self.signal_phases contains phase_ns)  { add phase_ns to: self.signal_phases; }
+					if !(self.signal_phases contains phase_ew)  { add phase_ew to: self.signal_phases; }
+					
+					loop lane over: local_lanes {
+						list<string> tokens <- lane.In_roi split_with "_";
+						if (length(tokens) >= 3) {
+							string lane_axis <- tokens[2]; 
+							
+							if (upper_case(lane_axis) = "NS" or upper_case(lane_axis) = "SN") {
+								lane.phase_id <- phase_ns;
+							} else if (upper_case(lane_axis) = "EW" or upper_case(lane_axis) = "WE") {
+								lane.phase_id <- phase_ew;
+							}
+						}
+					}
+					
+					list<traffic_light_visual> local_lights <- traffic_light_visual where (each.my_parent = current_intersection);
+					loop tl over: local_lights {
+						string old_p <- upper_case(tl.my_phase);
+						
+						if (old_p contains "_SN" or old_p contains "_NS") {
+							tl.my_phase <- phase_ns;
+						} else if (old_p contains "_EW") {
+							tl.my_phase <- phase_ew;
+						}
+					}
+				}
+			}
+		}
+		
+		// Call compute_crossing for all signal nodes AFTER phase assignment
+		// This initializes ang_in_N/S/E/W for correct directional vehicle counting in Paper mode
+		ask intersection where (each.is_traffic_signal) {
+			C_saturation <- c_saturation_flow;
+			list<point> sig_pts <- (traffic_light_visual where (each.my_parent = self)) collect each.location;
+			if (!empty(sig_pts)) {
+				do compute_crossing(sig_pts, self.location);
+			}
+		}
+		
+		// Re-initialize Paper/Fixed-time mode lights using my_phase (after signal_phases are set)
+		if (!use_cbmp) {
+			ask traffic_controller {
+				if (!empty(my_nodes) and !empty(my_nodes[0].signal_phases)) {
+					list<string> phases <- my_nodes[0].signal_phases;
+					if (length(phases) >= 2) {
+						current_paper_phase <- phases[0]; // start with NS phase (green)
+						traffic_controller ctrl <- self;
+						ask traffic_light_visual where (each.my_parent in my_nodes) {
+							state <- (my_phase = ctrl.current_paper_phase) ? "green" : "red";
+						}
+					}
+				}
+			}
+		}
+	}
+
+	reflex maintain_population {
+		if (traffic_demand != "Custom") {
+			// --- POISSON-BASED FREE SPAWNING SCENARIOS ---
+			spawn_timer <- spawn_timer + step;
+			
+			float spawn_interval <- 0.5; // Medium (900 vph) default
+			
+			// --- HIỆU CHUẨN CHUẨN XÁC 3 KỊCH BẢN THEO LƯU LƯỢNG (VPH / NHÁNH) ---
+			// Công thức: spawn_interval = 3600.0 / (vph * 8 nhánh vào)
+			if (traffic_demand = "Low (400 vph)") { 
+				spawn_interval <- 1.125; // 400 vph/nhánh (~0.89 xe/s)
+			} else if (traffic_demand = "Medium (900 vph)") { 
+				spawn_interval <- 0.50;  // 900 vph/nhánh (2.00 xe/s) 
+			} else if (traffic_demand = "High (1400 vph)") { 
+				spawn_interval <- 0.32;  // 1400 vph/nhánh (3.12 xe/s) 
+			}
+			
+			// Adjust spawn interval based on spawn_rate multiplier
+			if (spawn_rate > 0.0) {
+				spawn_interval <- spawn_interval / spawn_rate;
+			}
+
+			// Vòng lặp xử lý đầy đủ các xe cần sinh khi spawn_interval < step (nhất là kịch bản High 1400 vph)
+			int max_spawns_per_step <- 6;
+			int spawned_this_step <- 0;
+			
+			loop while: (spawn_timer >= spawn_interval and spawned_this_step < max_spawns_per_step) {
+				spawn_timer <- spawn_timer - spawn_interval;
+				spawned_this_step <- spawned_this_step + 1;
+				
+				list<intersection> available_nodes <- spawn_nodes where (length(vehicle overlapping circle(8.0, each.location)) < 6);
+				if (!empty(available_nodes)) {
+					intersection start_node <- one_of(available_nodes);
+					intersection end_node <- one_of(spawn_nodes);
+					
+					if (start_node != nil and end_node != nil and start_node != end_node) {
+						// Tỷ lệ thành phần xe thực tế: 85% xe máy, 12% ô tô con, 3% xe tải
+						float rnd_val <- rnd(1.0);
+						if (rnd_val < 0.85) {
+							create motobike number: 1 { location <- start_node.location; final_target <- end_node; }
+						} else if (rnd_val < 0.97) {
+							create car number: 1 { location <- start_node.location; final_target <- end_node; }
+						} else {
+							create truck number: 1 { location <- start_node.location; final_target <- end_node; }
+						}
+					}
+				}
+			}
+		} else {
+			// --- ORIGINAL POPULATION MAINTENANCE SCENARIOS ---
+			int diff_moto <- target_motobike - length(motobike);
+			int diff_car <- target_car - length(car);
+			int diff_truck <- target_truck - length(truck);
+			int total_diff <- max(0, diff_moto) + max(0, diff_car) + max(0, diff_truck);
+	
+			if (total_diff > 0) {
+				int spawn_count <- min(total_diff, 3);
+				loop times: spawn_count {
+					intersection end_node <- one_of(spawn_nodes);
+					if (end_node != nil) {
+						intersection start_node <- one_of(spawn_nodes);
+						if (start_node != nil and start_node != end_node) {
+							if (length(vehicle overlapping circle(8.0, start_node.location)) < 4) {
+								int rand_val <- rnd(total_diff - 1);
+								if (rand_val < max(0, diff_moto)) {
+									create motobike number: 1 { location <- start_node.location; final_target <- end_node; }
+								} else if (rand_val < max(0, diff_moto) + max(0, diff_car)) {
+									create car number: 1 { location <- start_node.location; final_target <- end_node; }
+								} else if (rand_val < max(0, diff_moto) + max(0, diff_car) + max(0, diff_truck)) {
+									create truck number: 1 { location <- start_node.location; final_target <- end_node; }
+								}
+							}
+						}
+					}
+				}
+			}
+			// Clean redundant population if custom limit decreases
+			if (diff_moto < 0) { ask abs(diff_moto) among (motobike as list) { do die; } }
+			if (diff_car < 0) { ask abs(diff_car) among (car as list) { do die; } }
+			if (diff_truck < 0) { ask abs(diff_truck) among (truck as list) { do die; } }
+		}
+	}
+}
+
+
+experiment test type: gui {
+	parameter "Kịch bản lưu lượng:" var: traffic_demand among: ["Low (400 vph)", "Medium (900 vph)", "High (1400 vph)"];
+	parameter "Thuật toán điều khiển:" var: algorithm_mode among: ["CBMP_Area", "CBMP_Paper_Fair"];
+	parameter "Tốc độ qua ngã tư (km/h):" var: intersection_speed_limit min: 5.0 #km / #h max: 25.0 #km / #h step: 1.0 #km / #h;
+	parameter "Hệ số bão hòa c (tốc độ qua nút):" var: c_saturation_flow min: 0.5 max: 3.0 step: 0.1;
+	parameter "Hệ số mật độ kẹt xe (Spawn Multiplier):" var: spawn_rate min: 1.0 max: 5.0 step: 0.5;
+	parameter "Lưu file CSV kết quả (khi chạy GUI):" var: is_batch_mode;
+	parameter "Debug logging (xem console):" var: debug_mode;
+	output {
+		display main type: 3d background: #black axes: false {
+			image background_img;
+			species road refresh: false;
+			species roi_lane refresh: true;
+			species building aspect: textured refresh: false;
+			species motobike;
+			species car;
+			species truck;
+			species intersection;
+			species traffic_light_visual;
+		}
+		
+		display heatmap type: 3d background: rgb(8, 12, 25) axes: false {
+			// base road layer 
+			species road aspect: heatmap_base refresh: false;
+			// overlay heat dots based on actual vehicle positions
+			species motobike aspect: heat_dot;
+			species car aspect: heat_dot;
+			species truck aspect: heat_dot;
+		}
+		
+		display KPI_Charts type: 2d {
+			chart "Chiều dài hàng chờ toàn mạng (Queue Length - Số xe dừng chờ)" type: series size: {1.0, 0.5} position: {0, 0} {
+				data "Hàng chờ ngã tư (xe)" value: sum(traffic_controller collect each.my_queue) color: #red marker: false;
+			}
+			chart "Lưu lượng thông hành toàn mạng (Throughput - Số xe thoát / chu kỳ)" type: series size: {1.0, 0.5} position: {0, 0.5} {
+				data "Xe thoát chu kỳ (xe)" value: sum(traffic_controller collect each.my_throughput) color: #green marker: false;
+			}
+		}
+	}
+}
+
+experiment batch_run type: batch keep_seed: false repeat: 10 until: stop_simulation parallel: 4 {
+
+	//"Low (400 vph)" "Medium (900 vph)", "High (1400 vph)" "CBMP_Paper_Fair"
+	parameter "Kịch bản lưu lượng:" var: traffic_demand among: ["Low (400 vph)"];
+	parameter "Thuật toán điều khiển:" var: algorithm_mode among: ["CBMP_Paper_Fair"];
+	parameter "Batch mode:" var: is_batch_mode init: true;
+	
+
+}
